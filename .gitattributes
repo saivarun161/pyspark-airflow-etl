@@ -1,0 +1,19 @@
+# Normalise line endings on checkin; check out native.
+* text=auto
+
+*.py    text diff=python
+*.toml  text
+*.yml   text
+*.yaml  text
+*.cfg   text
+*.md    text diff=markdown
+*.sh    text eol=lf
+
+# Binary payloads Git should never try to merge or diff.
+*.parquet binary
+*.avro    binary
+*.orc     binary
+*.png     binary
+*.jpg     binary
+*.gz      binary
+*.zip     binary

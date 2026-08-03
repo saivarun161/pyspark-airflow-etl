@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv*/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Spark / Hadoop local artifacts
+spark-warehouse/
+metastore_db/
+derby.log
+*.crc
+
+# Pipeline output
+warehouse/
+sample_data/
+
+# Airflow local state
+airflow.db
+airflow.cfg
+airflow_home/
+logs/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
