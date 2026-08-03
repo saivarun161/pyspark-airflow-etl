@@ -1,0 +1,180 @@
+"""Command line entry point: ``tripetl``."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+from collections.abc import Sequence
+
+from tripetl.config import DEFAULT_WAREHOUSE, PipelineConfig
+from tripetl.quality import engine, rulesets
+from tripetl.quality.gate import QualityGateFailed
+from tripetl.quality.rules import RuleSet
+from tripetl.session import session_scope
+from tripetl.sources import generate_sample
+
+#: Returned when a data-quality gate blocks the run. Distinct from 1 so a
+#: scheduler can tell "the data was bad" apart from "the job crashed" -- they
+#: want different people woken up.
+EXIT_GATE_FAILED = 2
+
+STAGE_RULESETS = {
+    "bronze": rulesets.bronze_ruleset,
+    "silver": rulesets.silver_ruleset,
+    "gold": rulesets.gold_ruleset,
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="tripetl",
+        description=(
+            "PySpark ETL for NYC taxi trips, with data-quality gates between every layer."
+        ),
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_sample_options(sub: argparse.ArgumentParser) -> None:
+        sub.add_argument("--rows", type=int, default=20_000, help="base rows to generate")
+        sub.add_argument("--seed", type=int, default=20260803, help="generator seed")
+        sub.add_argument(
+            "--dirty-rate",
+            type=float,
+            default=0.04,
+            help="fraction of rows carrying an injected defect (0 for pristine)",
+        )
+
+    run = subparsers.add_parser("run", help="run bronze -> silver -> gold")
+    run.add_argument(
+        "--input",
+        help="raw trip data; omit to generate a sample and run entirely offline",
+    )
+    run.add_argument("--format", default="parquet", choices=["parquet", "csv"])
+    run.add_argument("--warehouse", default=DEFAULT_WAREHOUSE, help="output root")
+    run.add_argument("--master", default="local[*]", help="Spark master URL")
+    run.add_argument(
+        "--no-gates",
+        action="store_true",
+        help="report quality failures without stopping the run",
+    )
+    run.add_argument(
+        "--no-quarantine",
+        action="store_true",
+        help="carry failing rows forward instead of diverting them",
+    )
+    add_sample_options(run)
+
+    sample = subparsers.add_parser("sample", help="write a synthetic raw dataset")
+    sample.add_argument("--out", required=True, help="destination path")
+    sample.add_argument("--format", default="parquet", choices=["parquet", "csv"])
+    sample.add_argument("--master", default="local[*]")
+    add_sample_options(sample)
+
+    quality = subparsers.add_parser(
+        "quality", help="check an existing dataset without writing anything"
+    )
+    quality.add_argument("--path", required=True, help="dataset to check")
+    quality.add_argument("--stage", required=True, choices=sorted(STAGE_RULESETS))
+    quality.add_argument("--format", default="parquet", choices=["parquet", "csv"])
+    quality.add_argument("--master", default="local[*]")
+    quality.add_argument(
+        "--markdown", action="store_true", help="emit a markdown table instead of text"
+    )
+
+    show = subparsers.add_parser("show", help="preview a dataset")
+    show.add_argument("--path", required=True)
+    show.add_argument("--limit", type=int, default=20)
+    show.add_argument("--format", default="parquet", choices=["parquet", "csv"])
+    show.add_argument("--master", default="local[*]")
+
+    return parser
+
+
+def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
+    return PipelineConfig(
+        warehouse=args.warehouse,
+        input_path=args.input,
+        input_format=args.format,
+        master=args.master,
+        enforce_gates=not args.no_gates,
+        quarantine_enabled=not args.no_quarantine,
+        sample_rows=args.rows,
+        sample_seed=args.seed,
+        sample_dirty_rate=args.dirty_rate,
+    )
+
+
+def _read(args: argparse.Namespace, session: object) -> object:
+    reader = session.read  # type: ignore[attr-defined]
+    if args.format == "csv":
+        return reader.option("header", "true").option("inferSchema", "true").csv(args.path)
+    return reader.parquet(args.path)
+
+
+def _command_run(args: argparse.Namespace) -> int:
+    from tripetl.pipeline import run_pipeline
+
+    config = _config_from_args(args)
+    try:
+        result = run_pipeline(config)
+    except QualityGateFailed as failure:
+        print(failure.report.to_text(), file=sys.stderr)
+        print(f"\n{failure}", file=sys.stderr)
+        return EXIT_GATE_FAILED
+
+    print(result.to_text())
+    for stage in result.stages:
+        print()
+        print(stage.report.to_text())
+    return 0
+
+
+def _command_sample(args: argparse.Namespace) -> int:
+    with session_scope(app_name="tripetl-sample", master=args.master) as session:
+        df = generate_sample(session, rows=args.rows, seed=args.seed, dirty_rate=args.dirty_rate)
+        writer = df.write.mode("overwrite")
+        if args.format == "csv":
+            writer.option("header", "true").csv(args.out)
+        else:
+            writer.parquet(args.out)
+        print(f"wrote {df.count():,} rows to {args.out}")
+    return 0
+
+
+def _command_quality(args: argparse.Namespace) -> int:
+    with session_scope(app_name="tripetl-quality", master=args.master) as session:
+        ruleset: RuleSet = STAGE_RULESETS[args.stage]()
+        report = engine.evaluate(_read(args, session), ruleset, stage=args.stage)
+        print(report.to_markdown() if args.markdown else report.to_text())
+        return 0 if report.passed else EXIT_GATE_FAILED
+
+
+def _command_show(args: argparse.Namespace) -> int:
+    with session_scope(app_name="tripetl-show", master=args.master) as session:
+        df = _read(args, session)
+        df.printSchema()  # type: ignore[attr-defined]
+        df.show(args.limit, truncate=False)  # type: ignore[attr-defined]
+    return 0
+
+
+COMMANDS = {
+    "run": _command_run,
+    "sample": _command_sample,
+    "quality": _command_quality,
+    "show": _command_show,
+}
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)-8s %(name)s: %(message)s",
+    )
+    return COMMANDS[args.command](args)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
