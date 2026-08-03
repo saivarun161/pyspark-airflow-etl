@@ -1,0 +1,152 @@
+"""Argument parsing and command exit codes."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from tripetl.cli import EXIT_GATE_FAILED, build_parser, main
+from tripetl.sources import generate_sample
+from tripetl.transforms.clean import clean
+
+pytestmark = pytest.mark.slow
+
+
+@pytest.fixture(scope="module")
+def bronze_dataset(tmp_path_factory, spark) -> str:
+    """A clean, bronze-shaped dataset on disk for the read-only commands."""
+    path = str(tmp_path_factory.mktemp("cli") / "bronze")
+    clean(generate_sample(spark, rows=200, seed=4, dirty_rate=0.0)).write.parquet(path)
+    return path
+
+
+def test_a_subcommand_is_required():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([])
+
+
+def test_run_defaults_are_offline_and_strict():
+    args = build_parser().parse_args(["run"])
+    assert args.input is None
+    assert args.no_gates is False
+    assert args.no_quarantine is False
+    assert args.dirty_rate == 0.04
+
+
+def test_run_flags_invert_the_defaults():
+    args = build_parser().parse_args(["run", "--no-gates", "--no-quarantine"])
+    assert args.no_gates is True
+    assert args.no_quarantine is True
+
+
+def test_an_unknown_stage_is_rejected():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["quality", "--path", "x", "--stage", "platinum"])
+
+
+def test_sample_writes_parquet(tmp_path, spark, capsys):
+    out = tmp_path / "sample"
+    assert main(["sample", "--out", str(out), "--rows", "100", "--seed", "2"]) == 0
+    assert "wrote" in capsys.readouterr().out
+    assert spark.read.parquet(str(out)).count() > 0
+
+
+def test_sample_writes_csv(tmp_path, spark):
+    out = tmp_path / "sample_csv"
+    assert (
+        main(
+            [
+                "sample",
+                "--out",
+                str(out),
+                "--rows",
+                "50",
+                "--dirty-rate",
+                "0",
+                "--format",
+                "csv",
+            ]
+        )
+        == 0
+    )
+    assert spark.read.option("header", "true").csv(str(out)).count() == 50
+
+
+def test_run_succeeds_and_reports(tmp_path, capsys):
+    exit_code = main(["run", "--warehouse", str(tmp_path / "wh"), "--rows", "300", "--seed", "6"])
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "pipeline PASSED" in output
+    assert "quality report :: gold" in output
+
+
+def test_run_returns_the_gate_exit_code_on_bad_data(tmp_path, capsys):
+    """A distinct code so a scheduler can tell bad data from a crash."""
+    exit_code = main(
+        [
+            "run",
+            "--warehouse",
+            str(tmp_path / "wh"),
+            "--rows",
+            "300",
+            "--dirty-rate",
+            "0.6",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_GATE_FAILED
+    assert "quality gate failed" in captured.err
+    assert not (tmp_path / "wh" / "gold").exists()
+
+
+def test_run_with_gates_disabled_succeeds_on_bad_data(tmp_path):
+    exit_code = main(
+        [
+            "run",
+            "--warehouse",
+            str(tmp_path / "wh"),
+            "--rows",
+            "300",
+            "--dirty-rate",
+            "0.6",
+            "--no-gates",
+        ]
+    )
+    assert exit_code == 0
+
+
+def test_quality_checks_a_dataset_in_place(bronze_dataset, capsys):
+    exit_code = main(["quality", "--path", bronze_dataset, "--stage", "bronze"])
+    output = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "PASSED" in output
+
+
+def test_quality_can_emit_markdown(bronze_dataset, capsys):
+    main(["quality", "--path", bronze_dataset, "--stage", "bronze", "--markdown"])
+    assert capsys.readouterr().out.startswith("| rule |")
+
+
+def test_quality_fails_on_a_dirty_dataset(tmp_path, spark):
+    path = str(tmp_path / "dirty")
+    clean(generate_sample(spark, rows=400, seed=9, dirty_rate=0.6)).write.parquet(path)
+
+    assert main(["quality", "--path", path, "--stage", "bronze"]) == EXIT_GATE_FAILED
+
+
+def test_show_previews_a_dataset(bronze_dataset, capsys):
+    assert main(["show", "--path", bronze_dataset, "--limit", "3"]) == 0
+    assert "pickup_at" in capsys.readouterr().out
+
+
+def test_run_accepts_an_explicit_input_path(tmp_path, spark):
+    raw = str(tmp_path / "raw")
+    generate_sample(spark, rows=200, seed=12, dirty_rate=0.0).write.parquet(raw)
+
+    exit_code = main(["run", "--input", raw, "--warehouse", str(tmp_path / "wh")])
+    assert exit_code == 0
+    assert Path(tmp_path / "wh" / "gold").exists()
