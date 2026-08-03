@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pipx install ruff==0.16.1
+
+      - run: ruff check .
+      - run: ruff format --check .
+
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Spark is a JVM application; PySpark is a client for it. Without a JDK
+      # the driver starts and every job dies at the first action.
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the package
+        run: |
+          uv venv --python ${{ matrix.python-version }} .venv
+          uv pip install -p .venv/bin/python -e ".[dev]"
+
+      - name: Run the test suite
+        run: .venv/bin/python -m pytest -q --cov --cov-report=term-missing
+
+  dag:
+    name: airflow dag integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Airflow lives in its own job and its own environment. It is a heavy
+      # dependency that the ETL package itself does not need -- the transforms
+      # and the gates are importable without it -- so keeping it out of the
+      # main test job keeps that separation honest rather than merely stated.
+      - name: Install with the airflow extra
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install -p .venv/bin/python -e ".[dev,airflow]"
+
+      - name: Check the DAG parses and is wired correctly
+        env:
+          AIRFLOW_HOME: ${{ runner.temp }}/airflow
+        run: .venv/bin/python -m pytest tests/test_dag.py -q
+
+  demo:
+    name: end-to-end demo (keyless)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the package
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install -p .venv/bin/python -e "."
+
+      # This is the README quickstart, run verbatim. If the published
+      # instructions stop working, the build goes red.
+      - name: Run the pipeline on generated data
+        run: .venv/bin/tripetl run --warehouse warehouse --rows 20000
+
+      - name: Confirm a dirty extract is blocked
+        run: |
+          set +e
+          .venv/bin/tripetl run --warehouse dirty-warehouse --rows 20000 --dirty-rate 0.3
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "expected exit code 2 from a blocked gate, got $code"
+            exit 1
+          fi
+          echo "gate correctly blocked the run"
+
+      - name: Publish the quality reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-reports
+          path: warehouse/_quality/
+          if-no-files-found: warn
