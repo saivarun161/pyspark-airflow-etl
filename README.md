@@ -185,6 +185,58 @@ and the failure modes are right there.
 
 ---
 
+## Schema drift
+
+The quality rules check *values*. Before any of them run, something has to
+check that the columns they name are still there, holding the types they
+expect — and declaring a schema, which this pipeline does, is not that check.
+
+Handing Spark a schema is a **projection, not an assertion**. Read a Parquet
+extract with `RAW_TRIP_SCHEMA` and a column the file no longer has comes back
+present and entirely null; a column the vendor added is dropped without a word;
+only a type Spark cannot reconcile at all raises — from inside the scan, naming
+a row group rather than the column. The all-null case is the expensive one:
+every `not_null` rule on that column reports 0% and the gate blocks, so the run
+*does* stop — but the report says *the data is bad* when what happened is *the
+source was renamed*, and that is an hour spent looking in the wrong place.
+
+So the run diffs the extract's stored layout against the declared one first,
+before it reads a row:
+
+```bash
+tripetl schema --path yellow_tripdata_2024-01.parquet
+```
+
+```
+schema check :: yellow_tripdata_2024-01.parquet :: DRIFTED
+  declared: 19   stored: 19   checked: names and types   blocking: 1   advisory: 2
+  [WARN ] widened[trip_distance]: declared double, stored as int
+  [BLOCK] missing[fare_amount]: declared double, absent from the source
+  [WARN ] unexpected[cbd_congestion_fee]: stored as double, never declared
+```
+
+Drift is graded, not pass/fail, on one question: **would it change how a row
+reads?**
+
+| kind | example | verdict |
+| --- | --- | --- |
+| **missing** | a declared column absent from the file | **blocks** — reads as all-null and fails a rule somewhere unrelated |
+| **mismatched** | `string` where `double` was declared | **blocks** — the read fails, or the values are not what the transforms expect |
+| **widened** | `int` where `double` was declared | advisory — Spark upcasts it losslessly |
+| **recased** | `VENDORID` for `VendorID` | advisory — Spark resolves names case-insensitively |
+| **unexpected** | the 2025 `cbd_congestion_fee` column | advisory — dropped by the declared read, and how you learn the feed grew |
+
+Blocking drift exits **2** and writes `warehouse/_quality/input_schema.json`,
+the same shape and lifecycle as a quality report: recorded before it is
+enforced, so a run stopped by drift leaves behind the evidence of what moved.
+`--no-schema-check` skips it; `--no-gates` downgrades it to a warning alongside
+the rule gates, since a first look at an unfamiliar extract wants the whole
+picture rather than a halt at the first surprise. Generated runs skip the check
+entirely — the sample is built from the declared schema, so it is on-schema by
+construction.
+
+---
+
 ## Airflow
 
 `dags/trip_etl_dag.py` maps the three stages onto three tasks:
@@ -219,13 +271,14 @@ where Airflow is not installed at all.
 | --- | --- |
 | `tripetl run` | bronze → silver → gold. `--input` for real data, omit it to generate. Exits **2** when a gate blocks |
 | `tripetl quality` | evaluate a rule set against any dataset, writing nothing. `--markdown` for a pasteable table |
+| `tripetl schema` | diff a raw extract's stored layout against the declared schema, writing nothing. Exits **2** on blocking drift |
 | `tripetl sample` | write a synthetic raw dataset. `--dirty-rate 0` for a pristine fixture |
 | `tripetl show` | print schema and rows — handy against `_quarantine/` |
 
 Useful flags: `--no-gates` reports failures without stopping (surveys an
 unfamiliar extract end to end instead of halting at the first problem);
-`--no-quarantine` carries failing rows forward; `--dirty-rate` controls injected
-defects.
+`--no-quarantine` carries failing rows forward; `--no-schema-check` skips the
+input schema comparison; `--dirty-rate` controls injected defects.
 
 ### Running against real data
 
@@ -238,6 +291,13 @@ curl -O https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.
 tripetl run --input yellow_tripdata_2024-01.parquet --warehouse warehouse
 ```
 
+Before it reads a row, the run compares the extract's stored layout against the
+declared schema. Look before you download a month you have not seen:
+
+```bash
+tripetl schema --path yellow_tripdata_2024-01.parquet   # CONFORMS, or names what moved
+```
+
 ---
 
 ## Project layout
@@ -247,7 +307,7 @@ src/tripetl/
   config.py           paths and policy, derived from one warehouse root
   session.py          SparkSession construction and ownership
   schema.py           explicit schemas for every layer — nothing is inferred
-  sources.py          reading raw trips; the deterministic sample generator
+  sources.py          reading raw trips; schema diff; the sample generator
   pipeline.py         run_bronze / run_silver / run_gold / run_pipeline
   cli.py              tripetl
   quality/
@@ -256,12 +316,13 @@ src/tripetl/
     gate.py           enforce() and QualityGateFailed
     report.py         QualityReport — json, text, markdown
     rulesets.py       the rule sets guarding each stage
+    drift.py          compare_schemas() and the SchemaDrift gate
   transforms/
     clean.py          normalize, trip_id, deduplicate
     enrich.py         duration, speed, unit economics, calendar
     aggregate.py      the gold mart
 dags/trip_etl_dag.py  the Airflow DAG
-tests/                108 tests
+tests/                141 tests
 ```
 
 ---
@@ -300,6 +361,15 @@ worse, it lets an upstream change alter types silently: a month where every
 `passenger_count` happens to be null arrives as `StringType`, and the downstream
 arithmetic starts producing nulls instead of an error.
 
+**The declared schema is checked, not just applied.** Declaring a schema and
+handing it to the reader looks like it asserts the layout; it only projects
+onto it. A dropped column reads back as all-null and fails a value rule three
+stages away from the cause, so the layout is compared to the declaration
+*before* the read, where a rename is one line naming the column rather than a
+mystery in the numbers. The diff is graded on whether a difference changes how
+a row reads — a missing column blocks, a vendor's new column does not — because
+a check that halts on every harmless addition is a check someone turns off.
+
 **Timestamps are timezone-aware at the source.** The session time zone is pinned
 to UTC, but that alone is not enough — PySpark converts a *naive* Python datetime
 using the **driver's local** zone, not the session zone. A generator built on
@@ -326,7 +396,7 @@ version-specific, with an error that points at the wrong place entirely.
 ## Tests
 
 ```bash
-pytest                      # 108 tests
+pytest                      # 141 tests
 pytest -m "not slow"        # skip the end-to-end warehouse runs
 pytest --cov                # coverage
 ```
