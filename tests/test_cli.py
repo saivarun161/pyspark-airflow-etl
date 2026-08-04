@@ -35,9 +35,14 @@ def test_run_defaults_are_offline_and_strict():
 
 
 def test_run_flags_invert_the_defaults():
-    args = build_parser().parse_args(["run", "--no-gates", "--no-quarantine"])
+    args = build_parser().parse_args(["run", "--no-gates", "--no-quarantine", "--no-schema-check"])
     assert args.no_gates is True
     assert args.no_quarantine is True
+    assert args.no_schema_check is True
+
+
+def test_run_checks_the_input_schema_by_default():
+    assert build_parser().parse_args(["run"]).no_schema_check is False
 
 
 def test_an_unknown_stage_is_rejected():
@@ -150,3 +155,44 @@ def test_run_accepts_an_explicit_input_path(tmp_path, spark):
     exit_code = main(["run", "--input", raw, "--warehouse", str(tmp_path / "wh")])
     assert exit_code == 0
     assert Path(tmp_path / "wh" / "gold").exists()
+
+
+def test_schema_reports_a_conforming_extract(tmp_path, spark, capsys):
+    raw = str(tmp_path / "raw")
+    generate_sample(spark, rows=100, seed=12, dirty_rate=0.0).write.parquet(raw)
+
+    assert main(["schema", "--path", raw]) == 0
+    assert "CONFORMS" in capsys.readouterr().out
+
+
+def test_schema_flags_a_drifted_extract(tmp_path, spark, capsys):
+    raw = str(tmp_path / "raw")
+    generate_sample(spark, rows=100, seed=12, dirty_rate=0.0).drop("fare_amount").write.parquet(raw)
+
+    assert main(["schema", "--path", raw]) == EXIT_GATE_FAILED
+    output = capsys.readouterr().out
+    assert "DRIFTED" in output
+    assert "fare_amount" in output
+
+
+def test_schema_can_emit_json(tmp_path, spark, capsys):
+    import json
+
+    raw = str(tmp_path / "raw")
+    generate_sample(spark, rows=100, seed=12, dirty_rate=0.0).write.parquet(raw)
+
+    assert main(["schema", "--path", raw, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["conforms"] is True
+
+
+def test_run_blocks_on_a_drifted_input(tmp_path, spark, capsys):
+    raw = str(tmp_path / "raw")
+    generate_sample(spark, rows=200, seed=12, dirty_rate=0.0).drop("fare_amount").write.parquet(raw)
+
+    exit_code = main(["run", "--input", raw, "--warehouse", str(tmp_path / "wh")])
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_GATE_FAILED
+    assert "schema drift" in captured.err
+    assert not (tmp_path / "wh" / "gold").exists()

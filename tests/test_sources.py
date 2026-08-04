@@ -7,7 +7,13 @@ from pyspark.sql import functions as F
 
 from tripetl.quality.engine import evaluate
 from tripetl.quality.rulesets import bronze_ruleset
-from tripetl.sources import DEFECTS, generate_sample, read_raw
+from tripetl.sources import (
+    DEFECTS,
+    generate_sample,
+    raw_schema_diff,
+    read_raw,
+    stored_schema,
+)
 from tripetl.transforms.clean import clean
 
 ROWS = 600
@@ -99,3 +105,49 @@ def test_read_raw_applies_the_declared_schema(spark, tmp_path):
     loaded = read_raw(spark, path)
     assert loaded.schema == RAW_TRIP_SCHEMA
     assert loaded.count() == expected_rows
+
+
+def test_stored_schema_reads_the_footer_without_scanning(spark, tmp_path):
+    from tripetl.schema import RAW_TRIP_SCHEMA
+
+    path = str(tmp_path / "raw")
+    generate_sample(spark, rows=50, seed=2).write.parquet(path)
+    assert stored_schema(spark, path) == RAW_TRIP_SCHEMA
+
+
+def test_a_generated_extract_conforms_to_the_declared_schema(spark, tmp_path):
+    path = str(tmp_path / "raw")
+    generate_sample(spark, rows=50, seed=2).write.parquet(path)
+
+    diff = raw_schema_diff(spark, path)
+    assert diff.conforms, diff.to_text()
+    assert diff.dataset == path
+
+
+def test_a_dropped_source_column_is_caught_before_reading(spark, tmp_path):
+    """The failure mode the whole module exists for: read_raw would paper over it."""
+    from tripetl.schema import RAW_TRIP_SCHEMA
+
+    path = str(tmp_path / "raw")
+    generate_sample(spark, rows=50, seed=2).drop("fare_amount").write.parquet(path)
+
+    diff = raw_schema_diff(spark, path)
+    assert not diff.conforms
+    assert any(drift.column == "fare_amount" for drift in diff.blocking)
+
+    # read_raw hands Spark the declared schema, so the dropped column comes
+    # back present and entirely null -- exactly the silent papering-over the
+    # pre-read check is there to prevent.
+    loaded = read_raw(spark, path)
+    assert loaded.schema == RAW_TRIP_SCHEMA
+    assert loaded.filter(F.col("fare_amount").isNotNull()).count() == 0
+
+
+def test_csv_extracts_are_checked_on_names_only(spark, tmp_path):
+    """A headered CSV read without inference is all strings; only names carry information."""
+    path = str(tmp_path / "raw_csv")
+    generate_sample(spark, rows=50, seed=2).write.option("header", "true").csv(path)
+
+    diff = raw_schema_diff(spark, path, fmt="csv")
+    assert diff.types_checked is False
+    assert diff.conforms, diff.to_text()

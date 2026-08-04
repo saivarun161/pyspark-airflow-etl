@@ -9,8 +9,10 @@ import pytest
 
 from tripetl.config import PipelineConfig
 from tripetl.pipeline import run_bronze, run_gold, run_pipeline, run_silver
+from tripetl.quality.drift import SchemaDriftError
 from tripetl.quality.engine import FAILURE_COLUMN
 from tripetl.quality.gate import QualityGateFailed
+from tripetl.sources import generate_sample
 
 pytestmark = pytest.mark.slow
 
@@ -156,6 +158,84 @@ def test_a_rerun_is_idempotent(tmp_path, spark):
 
     assert first.gold_rows == second.gold_rows
     assert first.stage("silver").rows_out == second.stage("silver").rows_out
+
+
+def _write_input(spark, tmp_path: Path, *, drop: str | None = None) -> str:
+    """A raw extract on disk, optionally missing a column, for the input path."""
+    path = str(tmp_path / "input")
+    raw = generate_sample(spark, rows=ROWS, seed=11, dirty_rate=0.0)
+    if drop is not None:
+        raw = raw.drop(drop)
+    raw.write.parquet(path)
+    return path
+
+
+def test_a_clean_input_passes_the_schema_check_and_runs(tmp_path, spark):
+    input_path = _write_input(spark, tmp_path)
+    config = _config(tmp_path, input_path=input_path)
+
+    result = run_pipeline(config, spark=spark)
+
+    assert result.passed
+    diff = json.loads(Path(config.schema_diff_path).read_text())
+    assert diff["conforms"] is True
+
+
+def test_a_dropped_input_column_stops_the_run_before_bronze(tmp_path, spark):
+    """The point of the check: fail naming the missing column, not a stage of
+    rules failing at 0% on a column that reads as nulls."""
+    input_path = _write_input(spark, tmp_path, drop="fare_amount")
+    config = _config(tmp_path, input_path=input_path)
+
+    with pytest.raises(SchemaDriftError) as excinfo:
+        run_pipeline(config, spark=spark)
+
+    assert any(drift.column == "fare_amount" for drift in excinfo.value.diff.blocking)
+    # Stopped before bronze: no stage report, no published mart.
+    assert not Path(config.report_path("bronze")).exists()
+    assert not Path(config.gold_path).exists()
+
+
+def test_the_schema_diff_is_recorded_even_when_it_blocks(tmp_path, spark):
+    input_path = _write_input(spark, tmp_path, drop="fare_amount")
+    config = _config(tmp_path, input_path=input_path)
+
+    with pytest.raises(SchemaDriftError):
+        run_pipeline(config, spark=spark)
+
+    diff = json.loads(Path(config.schema_diff_path).read_text())
+    assert diff["conforms"] is False
+    assert diff["blocking_count"] >= 1
+
+
+def test_the_schema_check_can_be_downgraded_with_the_gates(tmp_path, spark):
+    """enforce_gates=False surveys a drifted extract instead of stopping at it."""
+    input_path = _write_input(spark, tmp_path, drop="fare_amount")
+    config = _config(tmp_path, input_path=input_path, enforce_gates=False)
+
+    # The dropped column reads as nulls, so the bronze non_negative/in_range
+    # rules on fare_amount fail -- but the run gets far enough to prove the
+    # schema check did not raise.
+    result = run_pipeline(config, spark=spark)
+    assert not result.passed
+
+
+def test_the_schema_check_can_be_turned_off_independently(tmp_path, spark):
+    input_path = _write_input(spark, tmp_path, drop="fare_amount")
+    config = _config(tmp_path, input_path=input_path, check_input_schema=False)
+
+    # No SchemaDriftError -- the check is skipped -- so the run proceeds to the
+    # bronze gate, which then blocks on the all-null fare column.
+    with pytest.raises(QualityGateFailed) as excinfo:
+        run_pipeline(config, spark=spark)
+    assert excinfo.value.report.stage == "bronze"
+    assert not Path(config.schema_diff_path).exists()
+
+
+def test_a_generated_run_writes_no_schema_diff(completed):
+    """No input_path means nothing to diff; the sample is on-schema by construction."""
+    config, _ = completed
+    assert not Path(config.schema_diff_path).exists()
 
 
 def test_unknown_stage_lookup_raises(completed):
