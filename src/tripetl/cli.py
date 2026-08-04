@@ -9,14 +9,16 @@ from collections.abc import Sequence
 
 from tripetl.config import DEFAULT_WAREHOUSE, PipelineConfig
 from tripetl.quality import engine, rulesets
+from tripetl.quality.drift import SchemaDriftError
 from tripetl.quality.gate import QualityGateFailed
 from tripetl.quality.rules import RuleSet
 from tripetl.session import session_scope
-from tripetl.sources import generate_sample
+from tripetl.sources import generate_sample, raw_schema_diff
 
 #: Returned when a data-quality gate blocks the run. Distinct from 1 so a
 #: scheduler can tell "the data was bad" apart from "the job crashed" -- they
-#: want different people woken up.
+#: want different people woken up. Schema drift shares it: the source being
+#: wrong wakes the same person as the data being wrong.
 EXIT_GATE_FAILED = 2
 
 STAGE_RULESETS = {
@@ -64,6 +66,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="carry failing rows forward instead of diverting them",
     )
+    run.add_argument(
+        "--no-schema-check",
+        action="store_true",
+        help="skip comparing the input's stored layout to the declared schema",
+    )
     add_sample_options(run)
 
     sample = subparsers.add_parser("sample", help="write a synthetic raw dataset")
@@ -83,6 +90,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--markdown", action="store_true", help="emit a markdown table instead of text"
     )
 
+    schema = subparsers.add_parser(
+        "schema", help="compare a raw extract's stored layout to the declared schema"
+    )
+    schema.add_argument("--path", required=True, help="raw extract to inspect")
+    schema.add_argument("--format", default="parquet", choices=["parquet", "csv"])
+    schema.add_argument("--master", default="local[*]")
+    schema.add_argument("--json", action="store_true", help="emit the diff as JSON")
+
     show = subparsers.add_parser("show", help="preview a dataset")
     show.add_argument("--path", required=True)
     show.add_argument("--limit", type=int, default=20)
@@ -100,6 +115,7 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         master=args.master,
         enforce_gates=not args.no_gates,
         quarantine_enabled=not args.no_quarantine,
+        check_input_schema=not args.no_schema_check,
         sample_rows=args.rows,
         sample_seed=args.seed,
         sample_dirty_rate=args.dirty_rate,
@@ -121,6 +137,10 @@ def _command_run(args: argparse.Namespace) -> int:
         result = run_pipeline(config)
     except QualityGateFailed as failure:
         print(failure.report.to_text(), file=sys.stderr)
+        print(f"\n{failure}", file=sys.stderr)
+        return EXIT_GATE_FAILED
+    except SchemaDriftError as failure:
+        print(failure.diff.to_text(), file=sys.stderr)
         print(f"\n{failure}", file=sys.stderr)
         return EXIT_GATE_FAILED
 
@@ -151,6 +171,13 @@ def _command_quality(args: argparse.Namespace) -> int:
         return 0 if report.passed else EXIT_GATE_FAILED
 
 
+def _command_schema(args: argparse.Namespace) -> int:
+    with session_scope(app_name="tripetl-schema", master=args.master) as session:
+        diff = raw_schema_diff(session, args.path, fmt=args.format)
+        print(diff.to_json() if args.json else diff.to_text())
+        return 0 if diff.conforms else EXIT_GATE_FAILED
+
+
 def _command_show(args: argparse.Namespace) -> int:
     with session_scope(app_name="tripetl-show", master=args.master) as session:
         df = _read(args, session)
@@ -163,6 +190,7 @@ COMMANDS = {
     "run": _command_run,
     "sample": _command_sample,
     "quality": _command_quality,
+    "schema": _command_schema,
     "show": _command_show,
 }
 

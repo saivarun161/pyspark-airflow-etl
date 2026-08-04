@@ -36,6 +36,11 @@ PARAMS = {
     "seed": Param(20260803, type="integer", title="Sample seed"),
     "dirty_rate": Param(0.04, type="number", minimum=0, maximum=1, title="Injected defect rate"),
     "enforce_gates": Param(True, type="boolean", title="Fail the run on a bad gate"),
+    "check_input_schema": Param(
+        True,
+        type="boolean",
+        title="Check the input's layout against the declared schema",
+    ),
 }
 
 DEFAULT_ARGS = {
@@ -56,6 +61,7 @@ def _config() -> PipelineConfig:
         warehouse=params["warehouse"],
         input_path=params["input_path"] or None,
         enforce_gates=params["enforce_gates"],
+        check_input_schema=params["check_input_schema"],
         sample_rows=params["rows"],
         sample_seed=params["seed"],
         sample_dirty_rate=params["dirty_rate"],

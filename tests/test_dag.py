@@ -73,6 +73,7 @@ def test_every_runtime_knob_is_exposed_as_a_param(dag):
         "seed",
         "dirty_rate",
         "enforce_gates",
+        "check_input_schema",
     }
 
 
