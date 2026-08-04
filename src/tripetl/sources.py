@@ -13,7 +13,9 @@ import random
 from datetime import UTC, datetime, timedelta
 
 from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.types import StructType
 
+from tripetl.quality.drift import SchemaDiff, compare_schemas
 from tripetl.schema import MAX_LOCATION_ID, RAW_TRIP_SCHEMA
 
 #: Defects the generator knows how to inject, one per bronze rule worth
@@ -52,6 +54,39 @@ def read_raw(spark: SparkSession, path: str, *, fmt: str = "parquet") -> DataFra
     if fmt == "csv":
         reader = reader.option("header", "true")
     return reader.format(fmt).load(path)
+
+
+def stored_schema(spark: SparkSession, path: str, *, fmt: str = "parquet") -> StructType:
+    """Read the layout a source carries, without reading any of its rows.
+
+    Parquet keeps its schema in the file footer, so this costs a metadata read
+    rather than a scan. CSV carries no types at all: inference is left off here
+    -- it costs a full pass, and letting types be guessed is precisely what
+    this pipeline declares schemas to avoid -- so every column arrives as a
+    string and only the names carry information. :func:`raw_schema_diff`
+    accounts for that.
+    """
+    if fmt == "csv":
+        reader = spark.read.option("header", "true").option("inferSchema", "false")
+    else:
+        reader = spark.read
+    return reader.format(fmt).load(path).schema
+
+
+def raw_schema_diff(spark: SparkSession, path: str, *, fmt: str = "parquet") -> SchemaDiff:
+    """Compare the layout stored at ``path`` against :data:`RAW_TRIP_SCHEMA`.
+
+    Run before :func:`read_raw` rather than after it. Handing Spark a schema
+    projects the source onto it, so by the time there is a DataFrame the drift
+    has already been papered over -- a dropped column reads as a column of
+    nulls, and the evidence of why is gone.
+    """
+    return compare_schemas(
+        stored_schema(spark, path, fmt=fmt),
+        RAW_TRIP_SCHEMA,
+        dataset=path,
+        check_types=fmt != "csv",
+    )
 
 
 def generate_sample(

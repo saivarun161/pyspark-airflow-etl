@@ -30,6 +30,12 @@ class PipelineConfig:
     #: quality picture rather than the first thing that trips.
     enforce_gates: bool = True
 
+    #: Compare the input's stored layout against the declared schema before
+    #: reading a row of it. Only meaningful alongside ``input_path``: the
+    #: sample generator builds its rows from the declared schema, so a
+    #: generated run is on-schema by construction.
+    check_input_schema: bool = True
+
     #: Rows failing a quarantine-eligible rule are written here instead of
     #: being dropped. A row that vanishes without trace is a bug you find
     #: three months later in a revenue number.
@@ -69,6 +75,11 @@ class PipelineConfig:
     @property
     def reports_dir(self) -> str:
         return self._under("_quality")
+
+    @property
+    def schema_diff_path(self) -> str:
+        """Where the input's schema diff is recorded, beside the rule reports."""
+        return str(Path(self.reports_dir) / "input_schema.json")
 
     def quarantine_path(self, stage: str) -> str:
         return self._under("_quarantine", stage)

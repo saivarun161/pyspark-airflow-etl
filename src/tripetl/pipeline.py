@@ -17,11 +17,12 @@ from pyspark.sql import DataFrame, SparkSession
 
 from tripetl.config import PipelineConfig
 from tripetl.quality import engine, rulesets
+from tripetl.quality.drift import enforce_schema
 from tripetl.quality.gate import enforce
 from tripetl.quality.report import QualityReport
 from tripetl.quality.rules import RuleSet
 from tripetl.session import session_scope
-from tripetl.sources import generate_sample, read_raw
+from tripetl.sources import generate_sample, raw_schema_diff, read_raw
 from tripetl.transforms.aggregate import daily_zone_metrics
 from tripetl.transforms.clean import clean, deduplicate
 from tripetl.transforms.enrich import enrich
@@ -91,6 +92,25 @@ def _write_report(config: PipelineConfig, report: QualityReport) -> str:
     return str(path)
 
 
+def _check_input_schema(config: PipelineConfig, session: SparkSession) -> None:
+    """Compare the input's layout to the declared one before reading a row.
+
+    Recorded and enforced ahead of the read for the same reason the quality
+    reports are written before their gate: the run that stops is the one whose
+    evidence you need. A column that disappeared upstream is one line here,
+    against a stage report full of rules failing at 0% on a column that reads
+    as nulls for reasons the report cannot see.
+    """
+    if not config.input_path or not config.check_input_schema:
+        return
+
+    diff = raw_schema_diff(session, config.input_path, fmt=config.input_format)
+    path = Path(config.schema_diff_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(diff.to_json(), encoding="utf-8")
+    enforce_schema(diff, strict=config.enforce_gates)
+
+
 def _guard(
     config: PipelineConfig,
     df: DataFrame,
@@ -128,6 +148,7 @@ def run_bronze(config: PipelineConfig, *, spark: SparkSession | None = None) -> 
     """Ingest raw trips, key them, and gate on structural validity."""
     with session_scope(spark, **config.session_kwargs()) as session:
         if config.input_path:
+            _check_input_schema(config, session)
             raw = read_raw(session, config.input_path, fmt=config.input_format)
         else:
             logger.info(
@@ -228,7 +249,9 @@ def run_pipeline(config: PipelineConfig, *, spark: SparkSession | None = None) -
     """Run bronze, silver and gold in one session.
 
     Raises :class:`~tripetl.quality.gate.QualityGateFailed` at the first gate
-    that fails, unless ``config.enforce_gates`` is false.
+    that fails, or :class:`~tripetl.quality.drift.SchemaDriftError` before
+    bronze reads an input whose layout moved. Neither is raised when
+    ``config.enforce_gates`` is false.
     """
     with session_scope(spark, **config.session_kwargs()) as session:
         stages = (
