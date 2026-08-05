@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 from tripetl.quality.rules import Severity
 
@@ -34,6 +34,19 @@ class RuleResult:
         """True when this result should stop the pipeline."""
         return not self.passed and self.severity == Severity.ERROR.value
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> RuleResult:
+        """Rebuild a result from its JSON form.
+
+        The inverse of :func:`dataclasses.asdict`, with one fixup: JSON has no
+        tuples, so ``columns`` comes back as a list and has to be restored.
+        Without that a round-tripped result compares unequal to the one that
+        was written, which is exactly the comparison history is for.
+        """
+        fields = {key: payload[key] for key in _RESULT_FIELDS if key in payload}
+        columns = fields.get("columns") or ()
+        return cls(**{**fields, "columns": tuple(columns)})  # type: ignore[arg-type]
+
     def summary(self) -> str:
         status = "PASS" if self.passed else "FAIL"
         if self.kind == "row" and self.pass_rate is not None:
@@ -45,6 +58,11 @@ class RuleResult:
         else:
             detail = f"metric={self.metric:g}" if self.metric is not None else "no metric"
         return f"[{status}] {self.name}: {detail}"
+
+
+#: Read off the dataclass rather than restated, so a new field cannot be added
+#: to a result and silently dropped on the way back in from JSON.
+_RESULT_FIELDS = tuple(field.name for field in fields(RuleResult))
 
 
 @dataclass(frozen=True)
@@ -86,6 +104,23 @@ class QualityReport:
 
     def to_json(self, *, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, default=list)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, object]) -> QualityReport:
+        """Rebuild a report from the JSON written at a stage boundary.
+
+        ``passed``, ``error_count`` and ``warning_count`` are in the payload
+        for whoever reads the file by eye, but they are derived here rather
+        than restored: recomputing them from the results is what catches a
+        hand-edited or half-written artifact instead of trusting its verdict.
+        """
+        results = payload.get("results") or ()
+        return cls(
+            stage=str(payload["stage"]),
+            ruleset=str(payload["ruleset"]),
+            total_rows=int(payload["total_rows"]),  # type: ignore[arg-type]
+            results=tuple(RuleResult.from_dict(r) for r in results),  # type: ignore[union-attr]
+        )
 
     def to_text(self) -> str:
         verdict = "PASSED" if self.passed else "FAILED"
