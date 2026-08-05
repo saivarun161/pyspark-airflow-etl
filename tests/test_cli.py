@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tripetl.cli import EXIT_GATE_FAILED, build_parser, main
+from tripetl.quality.history import DEFAULT_TOLERANCE
 from tripetl.sources import generate_sample
 from tripetl.transforms.clean import clean
 
@@ -196,3 +197,81 @@ def test_run_blocks_on_a_drifted_input(tmp_path, spark, capsys):
     assert exit_code == EXIT_GATE_FAILED
     assert "schema drift" in captured.err
     assert not (tmp_path / "wh" / "gold").exists()
+
+
+# -- trend ------------------------------------------------------------------
+
+
+def test_trend_defaults_to_reporting_without_blocking():
+    args = build_parser().parse_args(["trend", "--stage", "bronze"])
+    assert args.fail_on_regression is False
+    assert args.tolerance == DEFAULT_TOLERANCE
+
+
+def test_trend_rejects_an_unknown_stage():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["trend", "--stage", "platinum"])
+
+
+@pytest.fixture(scope="module")
+def two_runs(tmp_path_factory) -> str:
+    """A warehouse whose second run is materially dirtier than its first."""
+    warehouse = str(tmp_path_factory.mktemp("trend") / "wh")
+    main(["run", "--warehouse", warehouse, "--rows", "300", "--seed", "41"])
+    main(
+        [
+            "run",
+            "--warehouse",
+            warehouse,
+            "--rows",
+            "300",
+            "--seed",
+            "42",
+            "--dirty-rate",
+            "0.3",
+            "--no-gates",
+        ]
+    )
+    return warehouse
+
+
+def test_trend_reports_the_movement_between_two_runs(two_runs, capsys):
+    assert main(["trend", "--warehouse", two_runs, "--stage", "bronze"]) == 0
+    output = capsys.readouterr().out
+
+    assert "quality trend :: bronze" in output
+    assert "REGRESSED" in output
+
+
+def test_trend_only_blocks_when_asked(two_runs):
+    exit_code = main(
+        ["trend", "--warehouse", two_runs, "--stage", "bronze", "--fail-on-regression"]
+    )
+    assert exit_code == EXIT_GATE_FAILED
+
+
+def test_trend_can_emit_json(two_runs, capsys):
+    import json
+
+    assert main(["trend", "--warehouse", two_runs, "--stage", "bronze", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["stage"] == "bronze"
+    assert payload["regression_count"] >= 1
+
+
+def test_trend_can_emit_markdown(two_runs, capsys):
+    main(["trend", "--warehouse", two_runs, "--stage", "bronze", "--markdown"])
+    assert capsys.readouterr().out.startswith("| rule |")
+
+
+def test_trend_says_so_when_there_is_not_enough_history(tmp_path, capsys):
+    warehouse = str(tmp_path / "wh")
+    main(["run", "--warehouse", warehouse, "--rows", "200", "--seed", "43"])
+
+    assert main(["trend", "--warehouse", warehouse, "--stage", "bronze"]) == 0
+    assert "not enough history" in capsys.readouterr().err
+
+
+def test_trend_on_an_empty_warehouse_is_not_an_error(tmp_path, capsys):
+    assert main(["trend", "--warehouse", str(tmp_path / "nothing"), "--stage", "bronze"]) == 0
+    assert "not enough history" in capsys.readouterr().err

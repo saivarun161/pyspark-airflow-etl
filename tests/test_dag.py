@@ -74,6 +74,8 @@ def test_every_runtime_knob_is_exposed_as_a_param(dag):
         "dirty_rate",
         "enforce_gates",
         "check_input_schema",
+        "keep_history",
+        "history_limit",
     }
 
 
@@ -107,3 +109,18 @@ def test_the_summary_payload_stays_small(dag_module):
     assert payload["gate_passed"] is True
     assert payload["warnings"] == []
     assert all(isinstance(value, (str, int, bool, list)) for value in payload.values())
+
+
+def test_the_run_id_comes_from_the_dag_run(dag_module):
+    """All three tasks file their reports under one name, and a retry overwrites."""
+
+    class _DagRun:
+        run_id = "scheduled__2026-08-05T06:00:00+00:00"
+
+    assert dag_module._run_id({"dag_run": _DagRun()}) == _DagRun.run_id
+
+
+def test_the_run_id_degrades_outside_a_dag_run(dag_module):
+    """Called from a shell or a test there is no dag_run; the pipeline generates one."""
+    assert dag_module._run_id({}) is None
+    assert dag_module._run_id({"dag_run": None}) is None

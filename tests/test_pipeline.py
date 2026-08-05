@@ -12,6 +12,7 @@ from tripetl.pipeline import run_bronze, run_gold, run_pipeline, run_silver
 from tripetl.quality.drift import SchemaDriftError
 from tripetl.quality.engine import FAILURE_COLUMN
 from tripetl.quality.gate import QualityGateFailed
+from tripetl.quality.history import ReportHistory, compare_runs
 from tripetl.sources import generate_sample
 
 pytestmark = pytest.mark.slow
@@ -249,3 +250,81 @@ def test_pipeline_summary_mentions_the_verdict(completed):
     text = result.to_text()
     assert "PASSED" in text
     assert "bronze" in text and "gold" in text
+
+
+# -- report history ---------------------------------------------------------
+
+
+def test_a_run_records_every_stage_under_one_run_id(completed):
+    """Three stages, three files, one name -- otherwise a run is unreconstructable."""
+    config, _ = completed
+    history = ReportHistory(config.history_dir)
+
+    assert history.stages() == ("bronze", "gold", "silver")
+    run_ids = {history.entries(stage)[-1].run_id for stage in history.stages()}
+    assert len(run_ids) == 1
+
+
+def test_a_recorded_report_matches_the_one_written_at_the_stage_boundary(completed):
+    config, result = completed
+    (entry,) = ReportHistory(config.history_dir).entries("bronze")
+    assert entry.report == result.stage("bronze").report
+
+
+def test_history_can_be_turned_off(tmp_path, spark):
+    config = _config(tmp_path, keep_history=False)
+    run_pipeline(config, spark=spark)
+    assert not Path(config.history_dir).exists()
+
+
+def test_a_blocked_run_still_records_its_history(tmp_path, spark):
+    """The failed run is exactly the one whose predecessors you go looking for."""
+    config = _config(tmp_path, sample_dirty_rate=0.6)
+    with pytest.raises(QualityGateFailed):
+        run_pipeline(config, spark=spark)
+
+    (entry,) = ReportHistory(config.history_dir).entries("bronze")
+    assert not entry.report.passed
+
+
+def test_a_second_run_becomes_a_comparable_trend(tmp_path, spark):
+    clean_config = _config(tmp_path, sample_seed=21)
+    run_pipeline(clean_config, spark=spark)
+    run_pipeline(
+        _config(tmp_path, sample_seed=22, sample_dirty_rate=0.2, enforce_gates=False), spark=spark
+    )
+
+    trend = compare_runs(ReportHistory(clean_config.history_dir), "bronze")
+
+    assert trend is not None
+    assert trend.previous_run_id != trend.current_run_id
+    # Six times the defect rate moves several rules well past the tolerance.
+    assert not trend.stable
+
+
+def test_history_is_pruned_to_the_configured_limit(tmp_path, spark):
+    # Gates off: this is about retention, and whether a given seed happens to
+    # trip a threshold on 400 rows is beside the point.
+    for seed in (31, 32, 33):
+        run_pipeline(
+            _config(tmp_path, sample_seed=seed, history_limit=2, enforce_gates=False),
+            spark=spark,
+        )
+
+    entries = ReportHistory(_config(tmp_path).history_dir).entries("bronze")
+    assert len(entries) == 2
+
+
+def test_an_explicit_run_id_is_used_verbatim(tmp_path, spark):
+    """What Airflow passes, so a cleared task overwrites rather than duplicates."""
+    config = _config(tmp_path, run_id="manual__2026-08-05T06:00:00+00:00")
+    run_pipeline(config, spark=spark)
+    run_pipeline(config, spark=spark)
+
+    entries = ReportHistory(config.history_dir).entries("bronze")
+    assert [entry.run_id for entry in entries] == ["manual__2026-08-05T06:00:00+00:00"]
+
+
+def test_a_history_limit_below_one_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="history_limit"):
+        _config(tmp_path, history_limit=0)
