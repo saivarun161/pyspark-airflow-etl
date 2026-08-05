@@ -10,7 +10,7 @@ implementation of the logic.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
@@ -19,6 +19,7 @@ from tripetl.config import PipelineConfig
 from tripetl.quality import engine, rulesets
 from tripetl.quality.drift import enforce_schema
 from tripetl.quality.gate import enforce
+from tripetl.quality.history import ReportHistory, new_run_id
 from tripetl.quality.report import QualityReport
 from tripetl.quality.rules import RuleSet
 from tripetl.session import session_scope
@@ -89,7 +90,30 @@ def _write_report(config: PipelineConfig, report: QualityReport) -> str:
     path = Path(config.report_path(report.stage))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(report.to_json(), encoding="utf-8")
+    _record_history(config, report)
     return str(path)
+
+
+def _record_history(config: PipelineConfig, report: QualityReport) -> None:
+    """Copy the report into the run history, then trim the oldest entries.
+
+    Also before the gate, and for a stronger reason than the report itself:
+    the run that blocks is the one whose predecessors you want to look at, and
+    a history that skips failed runs is missing exactly the entries that
+    explain how the failure arrived.
+
+    Never allowed to break a run. A warehouse whose history directory is
+    read-only is a warehouse that should still publish its mart; losing a
+    trend is a smaller failure than losing the pipeline.
+    """
+    if not config.keep_history:
+        return
+    try:
+        history = ReportHistory(config.history_dir)
+        history.record(report, run_id=config.run_id)
+        history.prune(report.stage, keep=config.history_limit)
+    except OSError:
+        logger.warning("could not record %s history under %s", report.stage, config.history_dir)
 
 
 def _check_input_schema(config: PipelineConfig, session: SparkSession) -> None:
@@ -252,7 +276,15 @@ def run_pipeline(config: PipelineConfig, *, spark: SparkSession | None = None) -
     that fails, or :class:`~tripetl.quality.drift.SchemaDriftError` before
     bronze reads an input whose layout moved. Neither is raised when
     ``config.enforce_gates`` is false.
+
+    A run id is settled here rather than per stage, so all three reports land
+    in the history under one name. Leaving each stage to generate its own from
+    the clock would key them seconds apart, and "what did bronze say on the run
+    where gold went wrong" would stop being answerable.
     """
+    if config.keep_history and config.run_id is None:
+        config = replace(config, run_id=new_run_id())
+
     with session_scope(spark, **config.session_kwargs()) as session:
         stages = (
             run_bronze(config, spark=session),

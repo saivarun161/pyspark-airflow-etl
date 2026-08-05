@@ -41,6 +41,8 @@ PARAMS = {
         type="boolean",
         title="Check the input's layout against the declared schema",
     ),
+    "keep_history": Param(True, type="boolean", title="Keep every run's quality report"),
+    "history_limit": Param(30, type="integer", minimum=1, title="Runs of history to retain"),
 }
 
 DEFAULT_ARGS = {
@@ -56,7 +58,8 @@ DEFAULT_ARGS = {
 
 def _config() -> PipelineConfig:
     """Build a pipeline config from the current run's params."""
-    params = get_current_context()["params"]
+    context = get_current_context()
+    params = context["params"]
     return PipelineConfig(
         warehouse=params["warehouse"],
         input_path=params["input_path"] or None,
@@ -65,7 +68,27 @@ def _config() -> PipelineConfig:
         sample_rows=params["rows"],
         sample_seed=params["seed"],
         sample_dirty_rate=params["dirty_rate"],
+        keep_history=params["keep_history"],
+        history_limit=params["history_limit"],
+        # Airflow's own run id, rather than one generated per task from the
+        # clock. Three tasks in three processes would otherwise file their
+        # reports under three different names seconds apart, and "what did
+        # bronze say on the run where gold went wrong" would have no answer.
+        # It also makes a cleared task idempotent: the retry overwrites its
+        # entry instead of adding a second one for the same run.
+        run_id=_run_id(context),
     )
+
+
+def _run_id(context: dict[str, object]) -> str | None:
+    """Name this run after the DAG run that triggered it.
+
+    ``dag_run`` is absent when a task function is called outside a run -- in a
+    unit test, or from the shell -- so this degrades to ``None`` and lets the
+    pipeline generate one rather than failing on a missing key.
+    """
+    dag_run = context.get("dag_run")
+    return getattr(dag_run, "run_id", None)
 
 
 def _summary(result: StageResult) -> dict[str, object]:

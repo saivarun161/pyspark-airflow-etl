@@ -41,6 +41,21 @@ class PipelineConfig:
     #: three months later in a revenue number.
     quarantine_enabled: bool = True
 
+    #: Keep every run's report, not only the last one. Without this each run
+    #: overwrites ``_quality/<stage>.json`` and a rule sliding towards its
+    #: threshold is invisible until the day it crosses.
+    keep_history: bool = True
+
+    #: Runs of history retained per stage. Old entries are pruned newest-first
+    #: after each write, so the directory stays a fixed size.
+    history_limit: int = 30
+
+    #: Identifies this run in the history. Left unset, one is generated from
+    #: the clock. Airflow passes its logical date instead, so a cleared task
+    #: re-recording its stage replaces that run rather than adding a second
+    #: entry for it, and all three stages of a run agree on what to call it.
+    run_id: str | None = None
+
     write_mode: str = "overwrite"
 
     #: Sample-generator settings, used when no ``input_path`` is given.
@@ -57,6 +72,8 @@ class PipelineConfig:
             )
         if self.sample_rows < 0:
             raise ValueError(f"sample_rows must be non-negative, got {self.sample_rows}")
+        if self.history_limit < 1:
+            raise ValueError(f"history_limit must be at least 1, got {self.history_limit}")
 
     # -- derived paths ----------------------------------------------------
 
@@ -75,6 +92,15 @@ class PipelineConfig:
     @property
     def reports_dir(self) -> str:
         return self._under("_quality")
+
+    @property
+    def history_dir(self) -> str:
+        """Past reports, under the report directory rather than beside it.
+
+        Everything that explains a run lives in ``_quality/``, so an incident
+        needs one directory copied out of the warehouse, not two.
+        """
+        return str(Path(self.reports_dir) / "history")
 
     @property
     def schema_diff_path(self) -> str:
