@@ -237,6 +237,81 @@ construction.
 
 ---
 
+## Trends
+
+A gate answers one question about one batch — is this good enough to publish?
+— and answers it without reference to anything that came before. That is the
+right shape for a gate. It is also why a gate cannot see the failure mode that
+shows up most often in practice: a rule that degrades slowly.
+
+```
+run 1   not_null[passenger_count]  99.98%   PASS
+run 2                              99.40%   PASS
+run 3                              98.60%   PASS
+run 4                              97.90%   FAIL   <- the first anyone hears of it
+```
+
+The gate is not wrong on any of the first three days; the data really was
+publishable. But something upstream broke a fortnight ago, and the run that
+finally blocks is the one with no history to explain it — because each run
+overwrote `_quality/bronze.json` with its own.
+
+So every report is also filed under `_quality/history/<stage>/<run_id>.json`,
+and any two runs can be compared:
+
+```bash
+tripetl trend --stage bronze
+```
+
+```
+quality trend :: bronze :: REGRESSED
+  20260805T173025Z -> 20260805T173036Z   rows: 8,080 -> 8,200 (+1.49%)   regressions: 4   tolerance: 0.50%
+  [  = ] not_null[pickup_at]: 100.0000% -> 100.0000% (+0.0000%)
+  [  = ] ordered[pickup_at<dropoff_at]: 99.7401% -> 99.3293% (-0.4108%)
+  [DOWN] in_range[trip_distance]: 99.7153% -> 99.0732% (-0.6422%)
+  [DOWN] accepted_values[payment_type]: 99.6782% -> 99.1098% (-0.5685%)
+  [DOWN] not_null[passenger_count]: 99.8144% -> 99.2561% (-0.5583%)
+  [  = ] row_count_at_least: pass -> pass
+```
+
+Every rule there is still passing its threshold. Both runs cleared the gate.
+The trend is the only thing in the pipeline that can see the slide.
+
+Movement is graded on the same question the schema check asks about columns —
+is this a change someone should act on?
+
+| grade | means |
+| --- | --- |
+| **regressed** | pass rate fell by more than the tolerance, **or** the rule crossed its threshold |
+| **improved** | rose by more than the tolerance, or started passing |
+| **steady** | moved by less than the tolerance |
+| **new** | not checked last run — the rule set gained a rule |
+| **dropped** | checked last run, not this one. "We stopped looking" is not "it passes" |
+
+The tolerance defaults to half a percentage point, deliberately coarse: daily
+feeds wobble, and a report that flags every fraction of a percent is noise on a
+good day and ignored on a bad one. `--tolerance 0.001` for a rule that lives at
+99.99%. Crossing a threshold regresses regardless of size — the gate is
+blocking runs, and a trend calling that "steady" would contradict it.
+
+Row counts are tracked alongside, because volume is the check no rule set
+covers: every rule can pass at 100% on a file that arrived a third short.
+
+**Trends do not block by default.** A threshold is a policy someone committed
+to; a tolerance is a guess until a few weeks of history have calibrated it, and
+a check that pages someone over a guess gets muted within a week. Opt in with
+`--fail-on-regression` (exits **2**) once the numbers have earned it.
+
+Reports are recorded *before* the gate, for a stronger reason than the reports
+themselves: the failed run is exactly the one whose predecessors you want to
+read. History that skipped failures would be missing the entries that explain
+how the failure arrived. The last 30 runs per stage are kept
+(`history_limit`), and a warehouse where the history cannot be written still
+publishes its mart — losing a trend is a smaller failure than losing the
+pipeline.
+
+---
+
 ## Airflow
 
 `dags/trip_etl_dag.py` maps the three stages onto three tasks:
@@ -253,6 +328,12 @@ The gates need no special Airflow machinery. A blocking rule raises
 `QualityGateFailed`, the task fails, and downstream tasks never run: the mart is
 simply not republished. Yesterday's numbers staying up beats today's bad numbers
 going out.
+
+Each task files its quality report under Airflow's own run id rather than one
+generated from the clock, so all three stages of a run agree on what to call it
+— *what did bronze say on the run where gold went wrong* stays answerable — and
+a cleared task overwrites its entry instead of adding a second one for the same
+run.
 
 ```bash
 pip install -e ".[dev,airflow]"
@@ -272,6 +353,7 @@ where Airflow is not installed at all.
 | `tripetl run` | bronze → silver → gold. `--input` for real data, omit it to generate. Exits **2** when a gate blocks |
 | `tripetl quality` | evaluate a rule set against any dataset, writing nothing. `--markdown` for a pasteable table |
 | `tripetl schema` | diff a raw extract's stored layout against the declared schema, writing nothing. Exits **2** on blocking drift |
+| `tripetl trend` | compare a stage's two most recent runs from the report history. Reports by default; `--fail-on-regression` exits **2** |
 | `tripetl sample` | write a synthetic raw dataset. `--dirty-rate 0` for a pristine fixture |
 | `tripetl show` | print schema and rows — handy against `_quarantine/` |
 
@@ -317,12 +399,13 @@ src/tripetl/
     report.py         QualityReport — json, text, markdown
     rulesets.py       the rule sets guarding each stage
     drift.py          compare_schemas() and the SchemaDrift gate
+    history.py        ReportHistory, and the run-over-run trend
   transforms/
     clean.py          normalize, trip_id, deduplicate
     enrich.py         duration, speed, unit economics, calendar
     aggregate.py      the gold mart
 dags/trip_etl_dag.py  the Airflow DAG
-tests/                141 tests
+tests/                213 tests
 ```
 
 ---
@@ -396,7 +479,7 @@ version-specific, with an error that points at the wrong place entirely.
 ## Tests
 
 ```bash
-pytest                      # 141 tests
+pytest                      # 213 tests
 pytest -m "not slow"        # skip the end-to-end warehouse runs
 pytest --cov                # coverage
 ```
