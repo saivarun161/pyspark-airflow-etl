@@ -11,6 +11,7 @@ from tripetl.config import DEFAULT_WAREHOUSE, PipelineConfig
 from tripetl.quality import engine, rulesets
 from tripetl.quality.drift import SchemaDriftError
 from tripetl.quality.gate import QualityGateFailed
+from tripetl.quality.history import DEFAULT_TOLERANCE, ReportHistory, compare_runs
 from tripetl.quality.rules import RuleSet
 from tripetl.session import session_scope
 from tripetl.sources import generate_sample, raw_schema_diff
@@ -98,6 +99,30 @@ def build_parser() -> argparse.ArgumentParser:
     schema.add_argument("--master", default="local[*]")
     schema.add_argument("--json", action="store_true", help="emit the diff as JSON")
 
+    trend = subparsers.add_parser(
+        "trend", help="compare a stage's two most recent runs from the report history"
+    )
+    trend.add_argument("--warehouse", default=DEFAULT_WAREHOUSE, help="warehouse root")
+    trend.add_argument("--stage", required=True, choices=sorted(STAGE_RULESETS))
+    trend.add_argument(
+        "--tolerance",
+        type=float,
+        default=DEFAULT_TOLERANCE,
+        help="how far a pass rate may move before it counts as a change",
+    )
+    trend.add_argument("--json", action="store_true", help="emit the trend as JSON")
+    trend.add_argument(
+        "--markdown", action="store_true", help="emit a markdown table instead of text"
+    )
+    # Opt-in rather than the default the gates use. A threshold is a policy
+    # someone signed up to; a tolerance is a guess until a few weeks of history
+    # have calibrated it, and a check that blocks on a guess gets switched off.
+    trend.add_argument(
+        "--fail-on-regression",
+        action="store_true",
+        help=f"exit {EXIT_GATE_FAILED} when a rule regressed since the previous run",
+    )
+
     show = subparsers.add_parser("show", help="preview a dataset")
     show.add_argument("--path", required=True)
     show.add_argument("--limit", type=int, default=20)
@@ -178,6 +203,33 @@ def _command_schema(args: argparse.Namespace) -> int:
         return 0 if diff.conforms else EXIT_GATE_FAILED
 
 
+def _command_trend(args: argparse.Namespace) -> int:
+    """Read the history off disk and diff the last two runs.
+
+    No SparkSession: the history is JSON written by earlier runs, and starting
+    a JVM to read it would make the one command you reach for mid-incident the
+    slowest one in the tool.
+    """
+    config = PipelineConfig(warehouse=args.warehouse)
+    trend = compare_runs(ReportHistory(config.history_dir), args.stage, tolerance=args.tolerance)
+    if trend is None:
+        print(
+            f"not enough history for stage {args.stage!r} under {config.history_dir}; "
+            "a trend needs two runs",
+            file=sys.stderr,
+        )
+        return 0
+
+    if args.json:
+        print(trend.to_json())
+    elif args.markdown:
+        print(trend.to_markdown())
+    else:
+        print(trend.to_text())
+
+    return EXIT_GATE_FAILED if args.fail_on_regression and not trend.stable else 0
+
+
 def _command_show(args: argparse.Namespace) -> int:
     with session_scope(app_name="tripetl-show", master=args.master) as session:
         df = _read(args, session)
@@ -191,6 +243,7 @@ COMMANDS = {
     "sample": _command_sample,
     "quality": _command_quality,
     "schema": _command_schema,
+    "trend": _command_trend,
     "show": _command_show,
 }
 
