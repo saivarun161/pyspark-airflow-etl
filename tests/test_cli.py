@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import pytest
 
-from tripetl.cli import EXIT_GATE_FAILED, build_parser, main
+from tripetl.cli import EXIT_GATE_FAILED, EXIT_USAGE, build_parser, main
 from tripetl.quality.history import DEFAULT_TOLERANCE
 from tripetl.sources import generate_sample
 from tripetl.transforms.clean import clean
@@ -44,6 +45,109 @@ def test_run_flags_invert_the_defaults():
 
 def test_run_checks_the_input_schema_by_default():
     assert build_parser().parse_args(["run"]).no_schema_check is False
+
+
+def test_run_processes_every_date_by_default():
+    args = build_parser().parse_args(["run"])
+    assert args.since is None
+    assert args.until is None
+    assert args.no_partitioning is False
+
+
+def test_the_window_is_parsed_into_dates():
+    args = build_parser().parse_args(["run", "--since", "2026-06-02", "--until", "2026-06-03"])
+    assert args.since == date(2026, 6, 2)
+    assert args.until == date(2026, 6, 3)
+
+
+def test_a_malformed_date_is_rejected_at_parse_time():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["run", "--since", "the second of June"])
+
+
+def test_a_backwards_window_is_a_usage_error_not_a_crash(tmp_path, capsys):
+    """Caught before Spark starts, so the one useful line is not under a stack trace."""
+    exit_code = main(
+        [
+            "run",
+            "--warehouse",
+            str(tmp_path / "wh"),
+            "--since",
+            "2026-06-05",
+            "--until",
+            "2026-06-01",
+        ]
+    )
+
+    assert exit_code == EXIT_USAGE
+    assert "since must not be after until" in capsys.readouterr().err
+
+
+def test_a_windowed_run_publishes_only_those_days(tmp_path, spark):
+    warehouse = tmp_path / "wh"
+    assert main(["run", "--warehouse", str(warehouse), "--rows", "300", "--dirty-rate", "0"]) == 0
+    assert len(list((warehouse / "gold" / "daily_zone_metrics").glob("pickup_date=*"))) > 1
+
+    assert (
+        main(
+            [
+                "run",
+                "--warehouse",
+                str(warehouse),
+                "--rows",
+                "300",
+                "--dirty-rate",
+                "0",
+                "--since",
+                "2026-06-03",
+                "--until",
+                "2026-06-03",
+            ]
+        )
+        == 0
+    )
+    # The other days are still there; only the named one was rebuilt.
+    days = {p.name for p in (warehouse / "gold" / "daily_zone_metrics").glob("pickup_date=*")}
+    assert "pickup_date=2026-06-03" in days
+    assert len(days) > 1
+
+
+def test_partitioning_can_be_disabled_from_the_command_line(tmp_path):
+    warehouse = tmp_path / "wh"
+    exit_code = main(
+        [
+            "run",
+            "--warehouse",
+            str(warehouse),
+            "--rows",
+            "300",
+            "--dirty-rate",
+            "0",
+            "--no-partitioning",
+        ]
+    )
+
+    assert exit_code == 0
+    assert not list((warehouse / "gold" / "daily_zone_metrics").glob("pickup_date=*"))
+
+
+def test_a_window_matching_nothing_exits_with_the_gate_code(tmp_path, capsys):
+    exit_code = main(
+        [
+            "run",
+            "--warehouse",
+            str(tmp_path / "wh"),
+            "--rows",
+            "200",
+            "--dirty-rate",
+            "0",
+            "--since",
+            "2030-01-01",
+        ]
+    )
+
+    assert exit_code == EXIT_GATE_FAILED
+    assert not (tmp_path / "wh" / "gold").exists()
 
 
 def test_an_unknown_stage_is_rejected():

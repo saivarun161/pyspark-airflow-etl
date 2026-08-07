@@ -6,8 +6,9 @@ import argparse
 import logging
 import sys
 from collections.abc import Sequence
+from datetime import date
 
-from tripetl.config import DEFAULT_WAREHOUSE, PipelineConfig
+from tripetl.config import DEFAULT_PARTITION_BY, DEFAULT_WAREHOUSE, PipelineConfig
 from tripetl.quality import engine, rulesets
 from tripetl.quality.drift import SchemaDriftError
 from tripetl.quality.gate import QualityGateFailed
@@ -21,6 +22,11 @@ from tripetl.sources import generate_sample, raw_schema_diff
 #: want different people woken up. Schema drift shares it: the source being
 #: wrong wakes the same person as the data being wrong.
 EXIT_GATE_FAILED = 2
+
+#: Returned when the arguments cannot describe a run at all -- a window that
+#: ends before it starts, a defect rate above 1. Distinct from
+#: :data:`EXIT_GATE_FAILED` because nobody needs paging over a typo.
+EXIT_USAGE = 1
 
 STAGE_RULESETS = {
     "bronze": rulesets.bronze_ruleset,
@@ -71,6 +77,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-schema-check",
         action="store_true",
         help="skip comparing the input's stored layout to the declared schema",
+    )
+    # A window plus partitioned writes is what makes a backfill safe: the run
+    # rebuilds the days it names and replaces exactly those partitions.
+    run.add_argument(
+        "--since",
+        type=date.fromisoformat,
+        metavar="YYYY-MM-DD",
+        help="process only trips picked up on or after this date",
+    )
+    run.add_argument(
+        "--until",
+        type=date.fromisoformat,
+        metavar="YYYY-MM-DD",
+        help="process only trips picked up on or before this date",
+    )
+    run.add_argument(
+        "--no-partitioning",
+        action="store_true",
+        help="write each layer as one flat dataset, so a run replaces all of it",
     )
     add_sample_options(run)
 
@@ -141,6 +166,9 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         enforce_gates=not args.no_gates,
         quarantine_enabled=not args.no_quarantine,
         check_input_schema=not args.no_schema_check,
+        partition_by=() if args.no_partitioning else DEFAULT_PARTITION_BY,
+        since=args.since,
+        until=args.until,
         sample_rows=args.rows,
         sample_seed=args.seed,
         sample_dirty_rate=args.dirty_rate,
@@ -155,9 +183,16 @@ def _read(args: argparse.Namespace, session: object) -> object:
 
 
 def _command_run(args: argparse.Namespace) -> int:
-    from tripetl.pipeline import run_pipeline
+    from tripetl.pipeline import NothingToPublish, run_pipeline
 
-    config = _config_from_args(args)
+    # A config that cannot be built is a usage error, not a crash. Reaching
+    # Spark first would bury the one useful line under a JVM stack trace.
+    try:
+        config = _config_from_args(args)
+    except ValueError as invalid:
+        print(f"tripetl run: {invalid}", file=sys.stderr)
+        return EXIT_USAGE
+
     try:
         result = run_pipeline(config)
     except QualityGateFailed as failure:
@@ -167,6 +202,11 @@ def _command_run(args: argparse.Namespace) -> int:
     except SchemaDriftError as failure:
         print(failure.diff.to_text(), file=sys.stderr)
         print(f"\n{failure}", file=sys.stderr)
+        return EXIT_GATE_FAILED
+    # An empty stage is a data problem too -- every row rejected, or a window
+    # naming days the input does not contain -- so it wakes the same person.
+    except NothingToPublish as failure:
+        print(f"{failure}", file=sys.stderr)
         return EXIT_GATE_FAILED
 
     print(result.to_text())
