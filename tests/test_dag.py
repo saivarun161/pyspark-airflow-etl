@@ -76,6 +76,8 @@ def test_every_runtime_knob_is_exposed_as_a_param(dag):
         "check_input_schema",
         "keep_history",
         "history_limit",
+        "since",
+        "until",
     }
 
 
@@ -83,6 +85,26 @@ def test_defaults_run_offline(dag):
     """A fresh Airflow install can run this DAG with nothing else configured."""
     assert dag.params["input_path"] is None
     assert dag.params["rows"] > 0
+
+
+def test_the_window_defaults_to_everything(dag):
+    """The sample the demo generates is a fixed week, not the run's logical date."""
+    assert dag.params["since"] is None
+    assert dag.params["until"] is None
+
+
+def test_window_params_are_read_as_dates(dag_module):
+    """Params carry JSON, so a date arrives as a string and has to be converted."""
+    from datetime import date
+
+    assert dag_module._as_date("2026-06-03") == date(2026, 6, 3)
+    assert dag_module._as_date(date(2026, 6, 3)) == date(2026, 6, 3)
+
+
+def test_a_blank_window_bound_means_unbounded(dag_module):
+    """Clearing the field in the UI yields "", which must not become a date."""
+    assert dag_module._as_date(None) is None
+    assert dag_module._as_date("") is None
 
 
 def test_tasks_retry_transient_failures(dag):
