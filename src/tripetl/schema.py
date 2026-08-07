@@ -60,6 +60,14 @@ COLUMN_RENAMES: dict[str, str] = {
     "airport_fee": "airport_fee",
 }
 
+#: The column every layer is partitioned by on disk.
+#:
+#: Derived at bronze rather than only in :mod:`tripetl.transforms.enrich`,
+#: because a partition key has to exist before the first write and bronze is
+#: the first write. The pickup date is the natural choice: it is the grain the
+#: mart already reports on, and it is the unit a re-run replaces.
+PARTITION_COLUMN = "pickup_date"
+
 #: Columns added by :mod:`tripetl.transforms.enrich`, in the order they appear.
 ENRICHED_COLUMNS: tuple[str, ...] = (
     "trip_duration_min",

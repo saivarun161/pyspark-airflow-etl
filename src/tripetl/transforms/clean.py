@@ -5,7 +5,7 @@ from __future__ import annotations
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
 
-from tripetl.schema import COLUMN_RENAMES
+from tripetl.schema import COLUMN_RENAMES, PARTITION_COLUMN
 
 #: Fields that together identify a trip. The feed ships no trip identifier, so
 #: one is derived from the properties that cannot coincide by chance: the same
@@ -64,6 +64,27 @@ def deduplicate(df: DataFrame) -> DataFrame:
     return df.dropDuplicates(["trip_id"])
 
 
+def pickup_date_expression() -> Column:
+    """The calendar date a trip started, used as the partition key.
+
+    Exported rather than inlined because :mod:`tripetl.transforms.enrich`
+    derives the same column for the mart. Two definitions that drifted apart --
+    one truncating in UTC and one in local time, say -- would file the same
+    trip under two different dates, and a run backfilling one of them would
+    leave the other behind as a stale duplicate.
+    """
+    return F.to_date(F.col("pickup_at"))
+
+
+def add_pickup_date(df: DataFrame) -> DataFrame:
+    """Attach the partition key.
+
+    Bronze needs it because bronze is the first write, and a partitioned write
+    cannot invent its key afterwards.
+    """
+    return df.withColumn(PARTITION_COLUMN, pickup_date_expression())
+
+
 def clean(df: DataFrame) -> DataFrame:
-    """Full bronze-shaping: normalize, then key."""
-    return add_trip_id(normalize(df))
+    """Full bronze-shaping: normalize, key, and date for the partition."""
+    return add_pickup_date(add_trip_id(normalize(df)))

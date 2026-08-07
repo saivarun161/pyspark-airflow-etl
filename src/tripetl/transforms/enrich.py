@@ -5,7 +5,8 @@ from __future__ import annotations
 from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
 
-from tripetl.schema import AIRPORT_RATE_CODES
+from tripetl.schema import AIRPORT_RATE_CODES, PARTITION_COLUMN
+from tripetl.transforms.clean import pickup_date_expression
 
 #: Hour-of-day buckets, as (label, first hour, last hour) inclusive.
 TIME_OF_DAY_BUCKETS: tuple[tuple[str, int, int], ...] = (
@@ -66,7 +67,12 @@ def enrich(df: DataFrame) -> DataFrame:
         F.round(_safe_divide(F.col("tip_amount") * F.lit(100.0), F.col("fare_amount")), 2),
     )
 
-    df = df.withColumn("pickup_date", F.to_date(F.col("pickup_at")))
+    # Bronze already derived this as its partition key, so on the real path
+    # this recomputes a column that is already correct. It stays because enrich
+    # is also called on frames that never went through `clean` -- the fixtures
+    # in the transform tests, and anything reading an older warehouse -- and
+    # sharing the expression is what guarantees the two agree.
+    df = df.withColumn(PARTITION_COLUMN, pickup_date_expression())
     df = df.withColumn("pickup_hour", F.hour(F.col("pickup_at")))
     df = df.withColumn("pickup_day_of_week", F.dayofweek(F.col("pickup_at")))
     df = df.withColumn("time_of_day", time_of_day_expression(F.col("pickup_hour")))

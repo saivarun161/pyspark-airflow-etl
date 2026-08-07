@@ -6,9 +6,9 @@ from datetime import UTC, date, datetime
 
 import pytest
 
-from tripetl.schema import GOLD_SCHEMA
+from tripetl.schema import GOLD_SCHEMA, PARTITION_COLUMN
 from tripetl.transforms.aggregate import daily_zone_metrics
-from tripetl.transforms.clean import add_trip_id, deduplicate, normalize
+from tripetl.transforms.clean import add_pickup_date, add_trip_id, clean, deduplicate, normalize
 from tripetl.transforms.enrich import enrich
 
 TRIP_SCHEMA = (
@@ -21,6 +21,8 @@ KEY_SCHEMA = (
     "pu_location_id int, do_location_id int, trip_distance double, "
     "fare_amount double, total_amount double"
 )
+
+LATE_TRIP_SCHEMA = "pickup_at timestamp, dropoff_at timestamp"
 
 # Timezone-aware: a naive datetime is converted using the driver's local zone,
 # which would make every hour-of-day assertion below machine-dependent.
@@ -100,6 +102,33 @@ def test_deduplicate_is_idempotent(make_df):
     rows = [(1, PICKUP, DROPOFF, 10, 20, 5.0, 20.0, 25.0)] * 3
     once = deduplicate(add_trip_id(make_df(rows, KEY_SCHEMA)))
     assert deduplicate(once).count() == once.count() == 1
+
+
+def test_clean_derives_the_partition_key(make_df):
+    """Bronze is the first write, so the partition key has to exist by then."""
+    df = make_df([(1, PICKUP, DROPOFF, 100, 200, 1.0, 10.0, 14.3)], KEY_SCHEMA)
+    shaped = clean(df)
+
+    assert PARTITION_COLUMN in shaped.columns
+    assert shaped.collect()[0][PARTITION_COLUMN] == date(2026, 6, 1)
+
+
+def test_the_partition_key_is_the_pickup_date_not_the_dropoff_date(make_df):
+    """A trip crossing midnight belongs to the day it started, in both layers."""
+    crossing = datetime(2026, 6, 2, 0, 20, 0, tzinfo=UTC)
+    df = make_df([(datetime(2026, 6, 1, 23, 50, tzinfo=UTC), crossing)], LATE_TRIP_SCHEMA)
+
+    assert add_pickup_date(df).collect()[0][PARTITION_COLUMN] == date(2026, 6, 1)
+
+
+def test_bronze_and_silver_agree_on_the_partition_key(make_df):
+    """Two definitions that disagreed would file one day's trips under two dates,
+    and a backfill of either would leave the other behind."""
+    df = make_df([(PICKUP, DROPOFF, 1.0, 10.0, 1.0, 1, 0.0)], TRIP_SCHEMA)
+
+    at_bronze = add_pickup_date(df).collect()[0][PARTITION_COLUMN]
+    at_silver = enrich(df).collect()[0][PARTITION_COLUMN]
+    assert at_bronze == at_silver
 
 
 # -- enrich -----------------------------------------------------------------
