@@ -99,7 +99,7 @@ flowchart TD
     SILVER --> SGATE{"silver gate"}
     SGATE --> GOLD["gold<br/>daily zone metrics"]
     GOLD --> GGATE{"gold gate"}
-    GGATE --> MART[("gold/daily_zone_metrics")]
+    GGATE --> MART[("gold/daily_zone_metrics<br/>pickup_date=…")]
 ```
 
 Three medallion layers, the same guard pattern between each:
@@ -312,6 +312,93 @@ pipeline.
 
 ---
 
+## Backfills
+
+Every layer is partitioned by pickup date:
+
+```
+warehouse/gold/daily_zone_metrics/
+  pickup_date=2026-06-01/part-00000-....parquet
+  pickup_date=2026-06-02/part-00000-....parquet
+  ...
+```
+
+That layout is not about read performance. It is about what a re-run is
+allowed to destroy.
+
+Reprocessing is not an edge case in a daily pipeline — a vendor republishes a
+month, a bug is found in a transform, a task fails and is cleared — and there
+are only three things a write can do about it:
+
+| write | rebuilding one day of January |
+| --- | --- |
+| `overwrite`, unpartitioned | replaces the dataset. February is gone |
+| `append` | keeps February, and now holds that January day twice |
+| `overwrite` + `partitionOverwriteMode=dynamic` | replaces that day's partition and nothing else |
+
+Only the third is a backfill. Spark's default is the first — *static* overwrite
+clears everything under the output path — so the third has to be asked for, and
+it is set here as a writer option rather than on the session, because the
+session belongs to whoever built it: the CLI, an Airflow task, a test.
+
+Scope a run with a window and it rebuilds exactly those days. Following on from
+the quickstart above, which published all seven:
+
+```bash
+tripetl run --rows 20000 --since 2026-06-03 --until 2026-06-03
+```
+
+```
+INFO     tripetl.pipeline: bronze input restricted to pickup dates 2026-06-03 .. 2026-06-03
+INFO     tripetl.pipeline: bronze restricted to pickup dates 2026-06-03 .. 2026-06-03
+INFO     tripetl.pipeline: silver restricted to pickup dates 2026-06-03 .. 2026-06-03
+bronze      3,059 in ->     2,968 out  quarantined=91      ok
+silver      2,968 in ->     2,905 out  quarantined=0       ok
+gold        2,905 in ->       265 out  quarantined=0       ok
+--------------------------------------------------------------------
+pipeline PASSED; 265 rows published
+```
+
+265 rows published, and all seven days still in the mart:
+
+```
+warehouse/gold/daily_zone_metrics/
+  pickup_date=2026-06-01   pickup_date=2026-06-05
+  pickup_date=2026-06-02   pickup_date=2026-06-06
+  pickup_date=2026-06-03   <- the only one rewritten
+  pickup_date=2026-06-04   pickup_date=2026-06-07
+```
+
+Running that command a second time changes nothing at all — the run replaces
+its own output rather than adding to it, which is what makes a cleared Airflow
+task safe to clear twice.
+
+The window is applied in two places for two reasons. At bronze it runs *before*
+the gate, so the quality report describes the rows the run actually processed
+rather than the file they were cut from — a report covering the whole month
+while the run published one day of it would misattribute every rate in it. At
+silver and gold it is applied to the read, where it is less a filter than a
+directory listing: the window names partitions, so Spark prunes the rest
+instead of scanning to find them. A one-day backfill should cost one day of
+I/O.
+
+`--no-partitioning` restores the flat, whole-dataset overwrite, and the test
+suite pins what that costs you: the same one-day rebuild against an
+unpartitioned warehouse leaves *only* that day behind.
+
+### Nothing to publish
+
+A stage that ends up with no rows stops the run with `NothingToPublish` rather
+than writing an empty dataset. A partitioned write of an empty frame produces
+no partitions at all — not an empty table, no directory — so the next stage
+reads a path that was never created and fails on schema inference, well away
+from the run that emptied it.
+
+It raises whatever `--no-gates` says. That flag governs how rule *verdicts* are
+treated, and "there is nothing to hand downstream" is not a verdict.
+
+---
+
 ## Airflow
 
 `dags/trip_etl_dag.py` maps the three stages onto three tasks:
@@ -335,6 +422,11 @@ generated from the clock, so all three stages of a run agree on what to call it
 a cleared task overwrites its entry instead of adding a second one for the same
 run.
 
+Clearing a task is safe to do twice for the same reason the data is: the write
+replaces the partitions it produced. `since` and `until` are exposed as params,
+so a backfill is this DAG with a window rather than a second DAG that drifts
+out of step with it.
+
 ```bash
 pip install -e ".[dev,airflow]"
 pytest tests/test_dag.py        # parses, wired in order, every knob exposed as a param
@@ -350,7 +442,7 @@ where Airflow is not installed at all.
 
 | command | does |
 | --- | --- |
-| `tripetl run` | bronze → silver → gold. `--input` for real data, omit it to generate. Exits **2** when a gate blocks |
+| `tripetl run` | bronze → silver → gold. `--input` for real data, omit it to generate. `--since`/`--until` to rebuild a date window. Exits **2** when a gate blocks |
 | `tripetl quality` | evaluate a rule set against any dataset, writing nothing. `--markdown` for a pasteable table |
 | `tripetl schema` | diff a raw extract's stored layout against the declared schema, writing nothing. Exits **2** on blocking drift |
 | `tripetl trend` | compare a stage's two most recent runs from the report history. Reports by default; `--fail-on-regression` exits **2** |
@@ -360,7 +452,12 @@ where Airflow is not installed at all.
 Useful flags: `--no-gates` reports failures without stopping (surveys an
 unfamiliar extract end to end instead of halting at the first problem);
 `--no-quarantine` carries failing rows forward; `--no-schema-check` skips the
-input schema comparison; `--dirty-rate` controls injected defects.
+input schema comparison; `--no-partitioning` writes each layer flat, so a run
+replaces all of it; `--dirty-rate` controls injected defects.
+
+Exit codes: **0** published, **2** the data was bad (a blocked gate, drifting
+schema, or a stage with nothing to publish), **1** the arguments could not
+describe a run at all. A scheduler wakes different people for the last two.
 
 ### Running against real data
 
@@ -401,11 +498,11 @@ src/tripetl/
     drift.py          compare_schemas() and the SchemaDrift gate
     history.py        ReportHistory, and the run-over-run trend
   transforms/
-    clean.py          normalize, trip_id, deduplicate
+    clean.py          normalize, trip_id, pickup_date, deduplicate
     enrich.py         duration, speed, unit economics, calendar
     aggregate.py      the gold mart
 dags/trip_etl_dag.py  the Airflow DAG
-tests/                213 tests
+tests/                238 tests
 ```
 
 ---
@@ -431,6 +528,21 @@ re-run the job — against data that may have moved on.
 
 **A blocked gate exits 2, not 1.** A scheduler can then tell "the data was bad"
 apart from "the job crashed". Those wake up different people.
+
+**The write is scoped to the partitions it produced.** What a re-run destroys
+is a design decision, not a detail of the writer, and Spark's default gets it
+wrong for anything that runs on a schedule: a static overwrite clears the whole
+output path, so rebuilding one day deletes the rest of the month. The usual
+workaround, appending, trades that for a duplicate the first time a task is
+retried. Dynamic partition overwrite is the only one of the three where
+reprocessing a day means reprocessing a day.
+
+**The partition key is derived at bronze, not at enrich.** A partitioned write
+cannot invent its key afterwards, and bronze is the first write. Enrich still
+derives the same column from the same shared expression, because it is also
+called on frames that never went through `clean` — two definitions that drifted
+apart would file one day's trips under two dates, and a backfill of either
+would leave the other behind.
 
 **Stage functions take an optional session and only stop what they created.**
 The CLI runs all three stages in one session; Airflow runs each in its own
@@ -476,10 +588,32 @@ version-specific, with an error that points at the wrong place entirely.
 
 ---
 
+## Roadmap
+
+Done:
+
+- [x] Declarative rule sets, severities and thresholds, checked in a single pass
+- [x] Quarantine with the broken rules attached, rather than silent drops
+- [x] Quality reports written before the gate that reads them
+- [x] Airflow DAG, one Spark application per layer
+- [x] Schema drift graded against the declared layout, checked before the read
+- [x] Report history and run-over-run trends
+- [x] Partitioned layers, date windows and idempotent backfills
+
+Next:
+
+- [ ] Declared bronze and silver schemas, so an empty layer still reads back
+- [ ] Rule sets loadable from configuration, not only from Python
+- [ ] Column profiling (`tripetl profile`) to calibrate thresholds from data
+- [ ] Quarantine replay: re-drive corrected rows without reprocessing the day
+- [ ] Freshness and volume checks against the history, not just within a run
+
+---
+
 ## Tests
 
 ```bash
-pytest                      # 213 tests
+pytest                      # 238 tests
 pytest -m "not slow"        # skip the end-to-end warehouse runs
 pytest --cov                # coverage
 ```
