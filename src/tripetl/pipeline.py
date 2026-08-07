@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
 
 from tripetl.config import PipelineConfig
 from tripetl.quality import engine, rulesets
@@ -22,6 +23,7 @@ from tripetl.quality.gate import enforce
 from tripetl.quality.history import ReportHistory, new_run_id
 from tripetl.quality.report import QualityReport
 from tripetl.quality.rules import RuleSet
+from tripetl.schema import PARTITION_COLUMN
 from tripetl.session import session_scope
 from tripetl.sources import generate_sample, raw_schema_diff, read_raw
 from tripetl.transforms.aggregate import daily_zone_metrics
@@ -29,6 +31,28 @@ from tripetl.transforms.clean import clean, deduplicate
 from tripetl.transforms.enrich import enrich
 
 logger = logging.getLogger(__name__)
+
+
+class NothingToPublish(RuntimeError):
+    """A stage finished with no rows to write.
+
+    Not a gate failure -- the rules may all have passed -- but not something to
+    carry on from either. A partitioned write of an empty frame produces no
+    partitions at all, so the next stage reads a path that was never created
+    and fails on schema inference, three stages of log output away from the run
+    that emptied it.
+
+    Raised whatever ``enforce_gates`` says, because that knob governs how rule
+    verdicts are treated, and this is not a verdict: there is no dataset to
+    hand downstream regardless of anyone's opinion about the rules.
+    """
+
+    def __init__(self, stage: str, rows_in: int) -> None:
+        self.stage = stage
+        self.rows_in = rows_in
+        super().__init__(
+            f"stage {stage!r} has nothing to publish: 0 rows survived out of {rows_in:,} read"
+        )
 
 
 @dataclass(frozen=True)
@@ -77,6 +101,66 @@ class PipelineResult:
             f"pipeline {'PASSED' if self.passed else 'FAILED'}; {self.gold_rows:,} rows published"
         )
         return "\n".join(lines)
+
+
+def _write(config: PipelineConfig, df: DataFrame, path: str) -> None:
+    """Write a layer, replacing only the partitions this run produced.
+
+    Spark's default is a *static* overwrite, which deletes everything under the
+    output path before writing -- the whole dataset when it is unpartitioned,
+    every partition when it is not. Either way, reprocessing one day of January
+    takes February with it, which is why so many pipelines reach for ``append``
+    and get duplicated days the first time a task is retried instead.
+
+    ``partitionOverwriteMode=dynamic`` narrows the delete to the partitions
+    actually present in this DataFrame. A run scoped to one day replaces that
+    day and touches nothing else, so a backfill is a backfill and a retry is a
+    no-op rather than a second copy.
+
+    Set as a writer option rather than on the session, because the session is
+    frequently not this code's to configure: the CLI builds one, Airflow builds
+    one per task, and a test hands one in. An option travels with the write.
+    """
+    writer = df.write.mode(config.write_mode)
+    if config.partition_by:
+        writer = writer.partitionBy(*config.partition_by).option(
+            "partitionOverwriteMode", "dynamic"
+        )
+    writer.parquet(path)
+
+
+def _publish(config: PipelineConfig, df: DataFrame, path: str, *, stage: str, rows_in: int) -> int:
+    """Count a stage's output, insist there is some, and write it."""
+    rows_out = df.count()
+    if rows_out == 0:
+        raise NothingToPublish(stage, rows_in)
+    _write(config, df, path)
+    return rows_out
+
+
+def _restrict(config: PipelineConfig, df: DataFrame, what: str) -> DataFrame:
+    """Narrow a frame to the run's date window.
+
+    Applied at bronze *before* the gate, so the report describes the rows the
+    run actually processed rather than a file it only partly read -- a report
+    covering January while the run published one day of it would misattribute
+    every rate in it.
+
+    Applied again to the silver and gold reads, where it is not a filter so
+    much as a directory listing: the window names partitions, so Spark prunes
+    the rest instead of scanning them. A one-day backfill should cost one day
+    of I/O, not a full pass over the warehouse to find the day.
+    """
+    if not config.has_window:
+        return df
+
+    logger.info("%s restricted to pickup dates %s", what, config.window_label)
+    partition = F.col(PARTITION_COLUMN)
+    if config.since is not None:
+        df = df.filter(partition >= F.lit(config.since))
+    if config.until is not None:
+        df = df.filter(partition <= F.lit(config.until))
+    return df
 
 
 def _write_report(config: PipelineConfig, report: QualityReport) -> str:
@@ -164,7 +248,7 @@ def _guard(
             stage,
             config.quarantine_path(stage),
         )
-    failing.write.mode(config.write_mode).parquet(config.quarantine_path(stage))
+    _write(config, failing, config.quarantine_path(stage))
     return passing, report, quarantined_rows
 
 
@@ -191,13 +275,18 @@ def run_bronze(config: PipelineConfig, *, spark: SparkSession | None = None) -> 
         # split. Without this the sample generator runs again between them and
         # the numbers in the report describe different rows than the ones
         # written out.
-        shaped = clean(raw).cache()
+        shaped = _restrict(config, clean(raw), "bronze input").cache()
         try:
             passing, report, quarantined = _guard(
                 config, shaped, rulesets.bronze_ruleset(), "bronze", quarantine=True
             )
-            rows_out = passing.count()
-            passing.write.mode(config.write_mode).parquet(config.bronze_path)
+            rows_out = _publish(
+                config,
+                passing,
+                config.bronze_path,
+                stage="bronze",
+                rows_in=report.total_rows,
+            )
         finally:
             shaped.unpersist()
 
@@ -214,7 +303,7 @@ def run_bronze(config: PipelineConfig, *, spark: SparkSession | None = None) -> 
 def run_silver(config: PipelineConfig, *, spark: SparkSession | None = None) -> StageResult:
     """Deduplicate and enrich bronze, then gate on derived-value plausibility."""
     with session_scope(spark, **config.session_kwargs()) as session:
-        bronze = session.read.parquet(config.bronze_path)
+        bronze = _restrict(config, session.read.parquet(config.bronze_path), "bronze")
         rows_in = bronze.count()
 
         enriched = enrich(deduplicate(bronze)).cache()
@@ -222,8 +311,9 @@ def run_silver(config: PipelineConfig, *, spark: SparkSession | None = None) -> 
             passing, report, quarantined = _guard(
                 config, enriched, rulesets.silver_ruleset(), "silver", quarantine=True
             )
-            rows_out = passing.count()
-            passing.write.mode(config.write_mode).parquet(config.silver_path)
+            rows_out = _publish(
+                config, passing, config.silver_path, stage="silver", rows_in=rows_in
+            )
         finally:
             enriched.unpersist()
 
@@ -246,7 +336,7 @@ def run_gold(config: PipelineConfig, *, spark: SparkSession | None = None) -> St
     failed to build.
     """
     with session_scope(spark, **config.session_kwargs()) as session:
-        silver = session.read.parquet(config.silver_path)
+        silver = _restrict(config, session.read.parquet(config.silver_path), "silver")
         rows_in = silver.count()
 
         gold = daily_zone_metrics(silver).cache()
@@ -254,8 +344,7 @@ def run_gold(config: PipelineConfig, *, spark: SparkSession | None = None) -> St
             published, report, _ = _guard(
                 config, gold, rulesets.gold_ruleset(), "gold", quarantine=False
             )
-            rows_out = published.count()
-            published.write.mode(config.write_mode).parquet(config.gold_path)
+            rows_out = _publish(config, published, config.gold_path, stage="gold", rows_in=rows_in)
         finally:
             gold.unpersist()
 

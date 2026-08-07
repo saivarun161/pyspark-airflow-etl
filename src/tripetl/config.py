@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
+from tripetl.schema import PARTITION_COLUMN
+
 DEFAULT_WAREHOUSE = "warehouse"
+
+#: How every layer is laid out on disk unless a caller says otherwise.
+DEFAULT_PARTITION_BY: tuple[str, ...] = (PARTITION_COLUMN,)
 
 
 @dataclass(frozen=True)
@@ -58,6 +64,25 @@ class PipelineConfig:
 
     write_mode: str = "overwrite"
 
+    #: Columns each layer is partitioned by on write.
+    #:
+    #: This is what decides what a re-run destroys. An unpartitioned
+    #: ``overwrite`` replaces the whole dataset, so reprocessing one day of
+    #: January deletes February; ``append`` avoids that and duplicates the day
+    #: the first time a task is retried. Partitioning by pickup date and
+    #: writing with Spark's *dynamic* overwrite gives the third answer:
+    #: replace exactly the days this run produced, leave every other day alone.
+    #:
+    #: Empty restores the flat, whole-dataset overwrite.
+    partition_by: tuple[str, ...] = DEFAULT_PARTITION_BY
+
+    #: Process only trips picked up within this window, inclusive at both ends.
+    #: Both unset processes everything the input holds. Setting them is how a
+    #: backfill is scoped -- and, with partitioned writes, how it stays
+    #: confined to the days it names.
+    since: date | None = None
+    until: date | None = None
+
     #: Sample-generator settings, used when no ``input_path`` is given.
     sample_rows: int = 20_000
     sample_seed: int = 20260803
@@ -74,6 +99,18 @@ class PipelineConfig:
             raise ValueError(f"sample_rows must be non-negative, got {self.sample_rows}")
         if self.history_limit < 1:
             raise ValueError(f"history_limit must be at least 1, got {self.history_limit}")
+        if self.since is not None and self.until is not None and self.since > self.until:
+            raise ValueError(f"since must not be after until, got {self.since} .. {self.until}")
+
+    @property
+    def has_window(self) -> bool:
+        """Whether this run is scoped to a subset of the input's dates."""
+        return self.since is not None or self.until is not None
+
+    @property
+    def window_label(self) -> str:
+        """The window as something a log line can carry."""
+        return f"{self.since or '*'} .. {self.until or '*'}"
 
     # -- derived paths ----------------------------------------------------
 

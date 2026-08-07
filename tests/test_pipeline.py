@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from tripetl.config import PipelineConfig
-from tripetl.pipeline import run_bronze, run_gold, run_pipeline, run_silver
+from tripetl.pipeline import NothingToPublish, run_bronze, run_gold, run_pipeline, run_silver
 from tripetl.quality.drift import SchemaDriftError
 from tripetl.quality.engine import FAILURE_COLUMN
 from tripetl.quality.gate import QualityGateFailed
@@ -214,11 +214,18 @@ def test_the_schema_check_can_be_downgraded_with_the_gates(tmp_path, spark):
     input_path = _write_input(spark, tmp_path, drop="fare_amount")
     config = _config(tmp_path, input_path=input_path, enforce_gates=False)
 
-    # The dropped column reads as nulls, so the bronze non_negative/in_range
-    # rules on fare_amount fail -- but the run gets far enough to prove the
-    # schema check did not raise.
-    result = run_pipeline(config, spark=spark)
-    assert not result.passed
+    # The dropped column reads as nulls, so every row breaks the bronze
+    # non_negative/in_range rules on fare_amount and every row is quarantined.
+    # The run therefore stops at bronze having nothing to publish -- which is
+    # already past the schema check, so the check did not raise.
+    with pytest.raises(NothingToPublish) as excinfo:
+        run_pipeline(config, spark=spark)
+
+    assert excinfo.value.stage == "bronze"
+    assert Path(config.schema_diff_path).exists()
+    # The report still describes what was read, gates or no gates.
+    payload = json.loads(Path(config.report_path("bronze")).read_text())
+    assert payload["passed"] is False
 
 
 def test_the_schema_check_can_be_turned_off_independently(tmp_path, spark):
